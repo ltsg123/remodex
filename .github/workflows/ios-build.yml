@@ -1,0 +1,388 @@
+name: iOS Build
+
+on:
+  push:
+    paths:
+      - ".github/workflows/ios-build.yml"
+      - "CodexMobile/**"
+  pull_request:
+    paths:
+      - ".github/workflows/ios-build.yml"
+      - "CodexMobile/**"
+  workflow_dispatch:
+    inputs:
+      export_signed_ipa:
+        description: "Export a signed IPA when signing secrets are configured"
+        required: false
+        default: false
+        type: boolean
+      bundle_id:
+        description: "Override bundle identifier for signed export"
+        required: false
+        default: ""
+        type: string
+      ota_base_url:
+        description: "Optional HTTPS base URL used for manifest.plist and install.html"
+        required: false
+        default: ""
+        type: string
+      strip_optional_entitlements:
+        description: "Use empty entitlements for self-hosted installs"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  ios-compile:
+    name: Compile on Xcode 16+
+    runs-on: macos-15
+    defaults:
+      run:
+        shell: bash
+        working-directory: CodexMobile
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Xcode version
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcode_major="$(xcodebuild -version | awk '/Xcode/ { print $2 }' | cut -d. -f1)"
+          if [[ "${xcode_major}" -lt 16 ]]; then
+            echo "::error::Expected Xcode 16+ but found $(xcodebuild -version | head -n1)"
+            exit 1
+          fi
+
+      - name: Resolve Swift packages
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project CodexMobile.xcodeproj \
+            -scheme CodexMobile
+
+      - name: Build for iOS Simulator
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project CodexMobile.xcodeproj \
+            -scheme CodexMobile \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+  signed-ipa:
+    name: Export Signed IPA
+    needs: ios-compile
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_signed_ipa }}
+    runs-on: macos-15
+    defaults:
+      run:
+        shell: bash
+        working-directory: CodexMobile
+    env:
+      APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_MOBILEPROVISION_BASE64: ${{ secrets.APPLE_MOBILEPROVISION_BASE64 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      OTA_BASE_URL: ${{ inputs.ota_base_url }}
+      REPO_BUNDLE_ID: ${{ vars.REMODEX_BUNDLE_ID }}
+      STRIP_OPTIONAL_ENTITLEMENTS: ${{ inputs.strip_optional_entitlements }}
+      WORKFLOW_BUNDLE_ID: ${{ inputs.bundle_id }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Xcode version
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcode_major="$(xcodebuild -version | awk '/Xcode/ { print $2 }' | cut -d. -f1)"
+          if [[ "${xcode_major}" -lt 16 ]]; then
+            echo "::error::Expected Xcode 16+ but found $(xcodebuild -version | head -n1)"
+            exit 1
+          fi
+
+      - name: Validate signing inputs
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in APPLE_CERTIFICATE_P12_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_MOBILEPROVISION_BASE64 APPLE_TEAM_ID; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing required secret: ${name}"
+              missing=1
+            fi
+          done
+
+          bundle_id="${WORKFLOW_BUNDLE_ID:-}"
+          if [[ -z "${bundle_id}" ]]; then
+            bundle_id="${REPO_BUNDLE_ID:-}"
+          fi
+
+          if [[ -z "${bundle_id}" ]]; then
+            echo "::error::Provide workflow input bundle_id or repo variable REMODEX_BUNDLE_ID"
+            missing=1
+          fi
+
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+
+          echo "REMODEX_EFFECTIVE_BUNDLE_ID=${bundle_id}" >> "${GITHUB_ENV}"
+
+      - name: Install certificate and provisioning profile
+        run: |
+          set -euo pipefail
+
+          keychain_path="${RUNNER_TEMP}/build-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          cert_path="${RUNNER_TEMP}/signing-cert.p12"
+          profile_path="${RUNNER_TEMP}/remodex.mobileprovision"
+          profile_plist="${RUNNER_TEMP}/remodex-profile.plist"
+
+          echo -n "${APPLE_CERTIFICATE_P12_BASE64}" | base64 --decode > "${cert_path}"
+          echo -n "${APPLE_MOBILEPROVISION_BASE64}" | base64 --decode > "${profile_path}"
+
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}" login.keychain-db
+          security import "${cert_path}" -P "${APPLE_CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${keychain_path}"
+          security set-key-partition-list -S apple-tool:,apple: -k "${keychain_password}" "${keychain_path}"
+
+          signing_identity="$(security find-identity -v -p codesigning "${keychain_path}" | awk -F'\"' '/\"/ { print $2; exit }')"
+          if [[ -z "${signing_identity}" ]]; then
+            echo "::error::No code-signing identity was imported from the provided certificate"
+            exit 1
+          fi
+
+          security cms -D -i "${profile_path}" > "${profile_plist}"
+          profile_uuid="$(/usr/libexec/PlistBuddy -c 'Print UUID' "${profile_plist}")"
+          profile_name="$(/usr/libexec/PlistBuddy -c 'Print Name' "${profile_plist}")"
+          profile_app_id="$(/usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' "${profile_plist}")"
+
+          mkdir -p "${HOME}/Library/MobileDevice/Provisioning Profiles"
+          cp "${profile_path}" "${HOME}/Library/MobileDevice/Provisioning Profiles/${profile_uuid}.mobileprovision"
+
+          if [[ "${profile_app_id}" != "${APPLE_TEAM_ID}.${REMODEX_EFFECTIVE_BUNDLE_ID}" && "${profile_app_id}" != "${APPLE_TEAM_ID}".* ]]; then
+            echo "::error::Provisioning profile application-identifier (${profile_app_id}) does not match ${APPLE_TEAM_ID}.${REMODEX_EFFECTIVE_BUNDLE_ID}"
+            exit 1
+          fi
+
+          get_task_allow="$(/usr/libexec/PlistBuddy -c 'Print Entitlements:get-task-allow' "${profile_plist}" 2>/dev/null || echo false)"
+          if /usr/libexec/PlistBuddy -c 'Print ProvisionsAllDevices' "${profile_plist}" >/dev/null 2>&1; then
+            export_method="enterprise"
+          elif /usr/libexec/PlistBuddy -c 'Print ProvisionedDevices:0' "${profile_plist}" >/dev/null 2>&1; then
+            if [[ "${get_task_allow}" == "true" ]]; then
+              export_method="development"
+            else
+              export_method="ad-hoc"
+            fi
+          else
+            export_method="app-store"
+          fi
+
+          echo "APPLE_SIGNING_IDENTITY=${signing_identity}" >> "${GITHUB_ENV}"
+          echo "EXPORT_METHOD=${export_method}" >> "${GITHUB_ENV}"
+          echo "KEYCHAIN_PATH=${keychain_path}" >> "${GITHUB_ENV}"
+          echo "PROFILE_NAME=${profile_name}" >> "${GITHUB_ENV}"
+          echo "PROFILE_PLIST=${profile_plist}" >> "${GITHUB_ENV}"
+          echo "PROFILE_UUID=${profile_uuid}" >> "${GITHUB_ENV}"
+
+      - name: Resolve Swift packages
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project CodexMobile.xcodeproj \
+            -scheme CodexMobile
+
+      - name: Prepare self-hosted entitlements
+        if: ${{ inputs.strip_optional_entitlements }}
+        run: |
+          set -euo pipefail
+          entitlements_path="${RUNNER_TEMP}/SelfHosted.entitlements"
+          cat > "${entitlements_path}" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict/>
+          </plist>
+          EOF
+          echo "CODE_SIGN_ENTITLEMENTS_OVERRIDE=${entitlements_path}" >> "${GITHUB_ENV}"
+
+      - name: Archive signed app
+        run: |
+          set -euo pipefail
+          archive_path="${RUNNER_TEMP}/Remodex.xcarchive"
+          xcode_args=(
+            -project CodexMobile.xcodeproj
+            -scheme CodexMobile
+            -configuration Release
+            -destination "generic/platform=iOS"
+            -archivePath "${archive_path}"
+            DEVELOPMENT_TEAM="${APPLE_TEAM_ID}"
+            PRODUCT_BUNDLE_IDENTIFIER="${REMODEX_EFFECTIVE_BUNDLE_ID}"
+            CODE_SIGN_STYLE=Manual
+            PROVISIONING_PROFILE_SPECIFIER="${PROFILE_NAME}"
+            CODE_SIGN_IDENTITY="${APPLE_SIGNING_IDENTITY}"
+            "OTHER_CODE_SIGN_FLAGS=--keychain ${KEYCHAIN_PATH}"
+          )
+
+          if [[ -n "${CODE_SIGN_ENTITLEMENTS_OVERRIDE:-}" ]]; then
+            xcode_args+=(
+              "CODE_SIGN_ENTITLEMENTS=${CODE_SIGN_ENTITLEMENTS_OVERRIDE}"
+              APS_ENVIRONMENT=
+            )
+          fi
+
+          xcodebuild "${xcode_args[@]}" archive
+
+      - name: Export IPA
+        run: |
+          set -euo pipefail
+          archive_path="${RUNNER_TEMP}/Remodex.xcarchive"
+          export_path="${RUNNER_TEMP}/signed-ipa"
+          export_options_path="${RUNNER_TEMP}/ExportOptions.plist"
+
+          cat > "${export_options_path}" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${EXPORT_METHOD}</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${REMODEX_EFFECTIVE_BUNDLE_ID}</key>
+              <string>${PROFILE_NAME}</string>
+            </dict>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>thinning</key>
+            <string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          EOF
+
+          mkdir -p "${export_path}"
+          xcodebuild \
+            -exportArchive \
+            -archivePath "${archive_path}" \
+            -exportPath "${export_path}" \
+            -exportOptionsPlist "${export_options_path}"
+
+          ipa_path="$(find "${export_path}" -maxdepth 1 -name '*.ipa' -print -quit)"
+          if [[ -z "${ipa_path}" ]]; then
+            echo "::error::Expected xcodebuild -exportArchive to produce an IPA"
+            exit 1
+          fi
+
+          cp "${ipa_path}" "${RUNNER_TEMP}/Remodex-selfhosted.ipa"
+          cat > "${RUNNER_TEMP}/ios-build-summary.txt" <<EOF
+          bundle_id=${REMODEX_EFFECTIVE_BUNDLE_ID}
+          export_method=${EXPORT_METHOD}
+          profile_name=${PROFILE_NAME}
+          stripped_optional_entitlements=${STRIP_OPTIONAL_ENTITLEMENTS}
+          xcode=$(xcodebuild -version | tr '\n' ' ' | sed 's/  */ /g')
+          EOF
+
+      - name: Generate OTA install files
+        if: ${{ inputs.ota_base_url != '' }}
+        run: |
+          set -euo pipefail
+          base_url="${OTA_BASE_URL%/}"
+          cat > "${RUNNER_TEMP}/manifest.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>items</key>
+            <array>
+              <dict>
+                <key>assets</key>
+                <array>
+                  <dict>
+                    <key>kind</key>
+                    <string>software-package</string>
+                    <key>url</key>
+                    <string>${base_url}/Remodex-selfhosted.ipa</string>
+                  </dict>
+                </array>
+                <key>metadata</key>
+                <dict>
+                  <key>bundle-identifier</key>
+                  <string>${REMODEX_EFFECTIVE_BUNDLE_ID}</string>
+                  <key>bundle-version</key>
+                  <string>112</string>
+                  <key>kind</key>
+                  <string>software</string>
+                  <key>title</key>
+                  <string>Remodex</string>
+                </dict>
+              </dict>
+            </array>
+          </dict>
+          </plist>
+          EOF
+
+          cat > "${RUNNER_TEMP}/install.html" <<EOF
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Install Remodex</title>
+            <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 24px; line-height: 1.5; }
+              a { display: inline-block; margin-top: 16px; padding: 12px 18px; border-radius: 10px; background: #111827; color: white; text-decoration: none; }
+              code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+            </style>
+          </head>
+          <body>
+            <h1>Install Remodex</h1>
+            <p>Upload <code>Remodex-selfhosted.ipa</code> and <code>manifest.plist</code> to the same HTTPS directory before opening this page on iPhone.</p>
+            <a href="itms-services://?action=download-manifest&url=${base_url}/manifest.plist">Install on iPhone</a>
+          </body>
+          </html>
+          EOF
+
+      - name: Upload signed IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: remodex-signed-ipa
+          path: |
+            ${{ runner.temp }}/Remodex-selfhosted.ipa
+            ${{ runner.temp }}/ios-build-summary.txt
+          if-no-files-found: error
+
+      - name: Upload OTA files
+        if: ${{ inputs.ota_base_url != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: remodex-ota-files
+          path: |
+            ${{ runner.temp }}/manifest.plist
+            ${{ runner.temp }}/install.html
+          if-no-files-found: error
+
+      - name: Clean up signing assets
+        if: ${{ always() }}
+        run: |
+          set +e
+          if [[ -n "${PROFILE_UUID:-}" ]]; then
+            rm -f "${HOME}/Library/MobileDevice/Provisioning Profiles/${PROFILE_UUID}.mobileprovision"
+          fi
+          if [[ -n "${KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "${KEYCHAIN_PATH}"
+          fi

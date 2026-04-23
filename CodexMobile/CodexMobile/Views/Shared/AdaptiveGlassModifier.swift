@@ -6,7 +6,6 @@ enum GlassPreference {
     static let storageKey = "codex.useLiquidGlass"
 
     static var isSupported: Bool {
-        if #available(iOS 26, *) { return true }
         return false
     }
 }
@@ -14,49 +13,36 @@ enum GlassPreference {
 // MARK: - Glass effect modifier
 
 private struct AdaptiveGlassModifier<S: Shape>: ViewModifier {
-    @AppStorage(GlassPreference.storageKey) private var glassEnabled = true
-    let regularStyle: Bool
+    @AppStorage(GlassPreference.storageKey) private var glassEnabled = false
     let shape: S
 
     func body(content: Content) -> some View {
-        if #available(iOS 26, *), glassEnabled {
-            if regularStyle {
-                content.glassEffect(.regular, in: shape)
-            } else {
-                content.glassEffect(in: shape)
-            }
-        } else {
-            content.background(.thinMaterial, in: shape)
-        }
+        let _ = glassEnabled
+        content.background(.thinMaterial, in: shape)
     }
 }
 
 // MARK: - Navigation bar modifier
 
 private struct AdaptiveNavigationBarModifier: ViewModifier {
-    @AppStorage(GlassPreference.storageKey) private var glassEnabled = true
+    @AppStorage(GlassPreference.storageKey) private var glassEnabled = false
 
     func body(content: Content) -> some View {
-        if #available(iOS 26, *), glassEnabled {
-            content
-        } else {
-            content
-        }
+        let _ = glassEnabled
+        content
     }
 }
 
 // MARK: - Toolbar item fallback (glass OFF or iOS < 26)
 
 private struct AdaptiveToolbarItemModifier<S: Shape>: ViewModifier {
-    @AppStorage(GlassPreference.storageKey) private var glassEnabled = true
+    @AppStorage(GlassPreference.storageKey) private var glassEnabled = false
     let shape: S
 
     func body(content: Content) -> some View {
-        if #available(iOS 26, *), glassEnabled {
-            content
-        } else {
-            content
-        }
+        let _ = glassEnabled
+        let _ = shape
+        content
     }
 }
 
@@ -68,11 +54,12 @@ enum AdaptiveGlassStyle {
 
 extension View {
     func adaptiveGlass(_ style: AdaptiveGlassStyle, in shape: some Shape) -> some View {
-        modifier(AdaptiveGlassModifier(regularStyle: true, shape: shape))
+        let _ = style
+        return modifier(AdaptiveGlassModifier(shape: shape))
     }
 
     func adaptiveGlass(in shape: some Shape) -> some View {
-        modifier(AdaptiveGlassModifier(regularStyle: false, shape: shape))
+        modifier(AdaptiveGlassModifier(shape: shape))
     }
 
     func adaptiveNavigationBar() -> some View {
